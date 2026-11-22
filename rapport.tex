@@ -1,0 +1,409 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage[expansion=false]{microtype}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{hyperref}
+
+\hypersetup{colorlinks=true,linkcolor=black,urlcolor=blue}
+\setlist{itemsep=2pt,topsep=4pt}
+\emergencystretch=3em
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  frame=single,
+  rulecolor=\color{black!30},
+  backgroundcolor=\color{black!3},
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  xleftmargin=0.3em,
+  xrightmargin=0.3em
+}
+\lstdefinestyle{cstyle}{language=C,keywordstyle=\bfseries\color{blue!60!black},commentstyle=\itshape\color{green!40!black}}
+
+\title{\textbf{Rapport de projet}\\[0.4em] Serveur de licences flottantes\\[0.4em]
+\large Programmation système Linux}
+\author{Maxime Johnson Yohan Finelle }
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+%------------------------------------------------------------
+\section{Sujet traité et fonctionnalités réalisées}
+%------------------------------------------------------------
+
+\subsection{Sujet}
+
+Le projet consiste à réaliser, en langage C sous Linux, un \textbf{serveur de licences flottantes}. Un nombre limité de licences ($N=3$) est partagé entre plusieurs clients ($M=5$ au maximum simultanément). Un client qui souhaite utiliser le logiciel doit obtenir une licence auprès du serveur, la conserver pendant une durée donnée, puis la rendre. Si aucune licence n'est disponible, il est mis en attente jusqu'à ce qu'une licence se libère. Une licence ne peut pas être conservée indéfiniment : le serveur la reprend après une durée maximale (\code{LICENSE\_DUREE}, 10~s pour les tests et 30~s dans la version finale).
+
+Le serveur et les clients sont des \textbf{processus distincts} qui communiquent exclusivement par \textbf{files de messages POSIX}. Les paramètres du système sont regroupés dans l'en-tête commun \code{serveur.h} : \code{NB\_LICENSES}, \code{MAX\_CLIENTS}, \code{LICENSE\_DUREE}, ainsi que les noms des files et le format des messages.
+
+\subsection{Fonctionnalités réalisées}
+
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{4.2cm}Y@{}}
+\toprule
+\textbf{Fonctionnalité} & \textbf{Description}\\
+\midrule
+Connexion / déconnexion & Un client s'enregistre une seule fois auprès du serveur et se déconnecte proprement à la fin.\\
+Limitation à $M$ clients & Au-delà de $M$ clients connectés, la connexion est refusée (\code{RSP\_FULL}).\\
+Demande de licence & Le client peut demander une licence précise (0 à $N-1$) ou n'importe laquelle (\code{-1}).\\
+Attribution immédiate & Si la licence voulue (ou une autre) est libre, elle est attribuée tout de suite (\code{RSP\_GRANT}).\\
+File d'attente & Si aucune licence n'est libre, le client est mis en attente (\code{RSP\_WAIT}) puis servi dès qu'une licence se libère.\\
+Historique minimal & Le serveur mémorise la dernière licence utilisée par chaque client et la lui propose en priorité.\\
+Restitution volontaire & Le client rend sa licence (\code{MSG\_RELEASE}) tout en restant connecté.\\
+Expiration automatique & Un thread de surveillance reprend les licences gardées plus de \code{LICENSE\_DUREE} secondes et prévient le client (\code{RSP\_EXPIRED}).\\
+Libération à la déconnexion & Les licences d'un client qui se déconnecte sont libérées et redistribuées.\\
+Client injoignable & Si l'envoi d'une réponse échoue (file absente ou pleine), le client est considéré comme déconnecté.\\
+Contrôle des erreurs & Demande invalide, licence déjà détenue, client déjà en attente, numéro hors bornes : réponse \code{RSP\_ERROR}.\\
+Arrêt propre & SIGINT et SIGTERM arrêtent le serveur et les clients en nettoyant les files de messages.\\
+\bottomrule
+\end{tabularx}
+
+\subsection{Utilisation}
+
+Le serveur se lance sans argument. Chaque client est interactif : il lit au clavier des lignes de la forme \code{licence durée} :
+\begin{itemize}
+  \item \code{2 5} : demande la licence 2 pendant 5 secondes ;
+  \item \code{-1 3} : demande n'importe quelle licence pendant 3 secondes ;
+  \item Ctrl-C ou Ctrl-D : déconnexion propre.
+\end{itemize}
+
+%------------------------------------------------------------
+\section{Architecture générale}
+%------------------------------------------------------------
+
+\subsection{Vue d'ensemble}
+
+L'application comporte trois fichiers :
+\begin{itemize}
+  \item \code{serveur.h} : constantes et \textbf{protocole} (types de messages et structures \code{Request} et \code{Response}) ;
+  \item \code{serveur.c} : le serveur, avec son état global, son thread principal et son thread de surveillance ;
+  \item \code{client.c} : le client interactif.
+\end{itemize}
+
+\begin{lstlisting}
+ Client A --+                          +- Thread principal : mq_receive,
+ Client B --+--> /lic_requests ------->|  traitement des requetes
+ Client C --+    (file unique)         |
+                                       +- Thread monitor : expiration
+                                          des licences (1 fois / s)
+                  mutex unique `mtx' : protege lic[], clients[], queue[]
+
+ Client A <-+
+ Client B <-+---- /lic_reply_<pid> <---- (une file de reponses par client)
+ Client C <-+
+\end{lstlisting}
+
+\subsection{Protocole de communication}
+
+Les deux structures échangées sont de taille fixe, ce qui permet de les envoyer telles quelles dans une file de messages :
+
+\begin{lstlisting}[style=cstyle]
+typedef enum { MSG_CONNECT, MSG_REQUEST, MSG_RELEASE, MSG_DISCONNECT } ReqType;
+typedef enum { RSP_OK, RSP_FULL, RSP_GRANT, RSP_WAIT, RSP_EXPIRED, RSP_ERROR } RspType;
+
+typedef struct { ReqType type; pid_t pid; int license_id; } Request;
+typedef struct { RspType type; int license_id; } Response;
+\end{lstlisting}
+
+Le champ \code{pid} identifie le client et sert à construire le nom de sa file de réponses (\code{CLIENT\_QUEUE\_FMT}, de la forme \code{/lic\_reply\_<pid>}). Le champ \code{license\_id} désigne la licence souhaitée dans \code{MSG\_REQUEST}, la licence rendue dans \code{MSG\_RELEASE}, et la licence attribuée ou reprise dans \code{RSP\_GRANT} et \code{RSP\_EXPIRED}.
+
+\medskip
+\begin{tabularx}{\textwidth}{@{}llY@{}}
+\toprule
+\textbf{Requête} & \textbf{Traitement serveur} & \textbf{Réponses possibles}\\
+\midrule
+\code{MSG\_CONNECT} & \code{handle\_connect} & \code{RSP\_OK}, \code{RSP\_FULL}\\
+\code{MSG\_REQUEST} & \code{handle\_request} & \code{RSP\_GRANT}, \code{RSP\_WAIT} (puis \code{RSP\_GRANT} plus tard), \code{RSP\_ERROR}\\
+\code{MSG\_RELEASE} & \code{handle\_release} & aucune\\
+\code{MSG\_DISCONNECT} & \code{handle\_disconnect} & aucune\\
+\bottomrule
+\end{tabularx}
+\medskip
+
+À cela s'ajoute \code{RSP\_EXPIRED}, envoyé spontanément par le thread de surveillance.
+
+\subsection{Structures de données du serveur}
+
+\begin{itemize}
+  \item \code{License lic[NB\_LICENSES]} : pour chaque licence, un indicateur d'utilisation, le PID du propriétaire et l'instant d'attribution (horloge monotone, en secondes).
+  \item \code{Client clients[MAX\_CLIENTS]} : clients connectés, avec le PID et \code{last\_license} (historique minimal, $-1$ si aucune).
+  \item \code{Waiter queue[MAX\_CLIENTS]} : file d'attente ordonnée, chaque élément contenant le PID et la licence préférée du client. Sa taille suffit : un client doit être connecté pour demander et ne peut pas être en attente deux fois, il y a donc au plus $M$ entrées.
+  \item \code{mtx} : mutex unique protégeant l'ensemble de cet état.
+  \item \code{clients\_sem} : sémaphore compteur initialisé à $M$.
+  \item \code{running} : drapeau \code{volatile sig\_atomic\_t} d'arrêt.
+\end{itemize}
+
+\subsection{Déroulement côté serveur}
+
+Le thread principal boucle sur \code{mq\_receive} et aiguille chaque requête vers son handler. Le thread \code{monitor\_thread} se réveille chaque seconde, prend le mutex et parcourt les licences : toute licence détenue depuis \code{LICENSE\_DUREE} secondes ou plus est reprise (message \code{RSP\_EXPIRED} au client, puis \code{release\_license}).
+
+Le c\oe ur du serveur est le couple \code{release\_license} / \code{dispatch} :
+\begin{enumerate}
+  \item \code{release\_license(k)} marque la licence libre ;
+  \item \code{dispatch(k)} cherche dans la file d'attente un client qui préfère cette licence, sinon prend la tête de file, lui envoie \code{RSP\_GRANT} et appelle \code{assign}. Si le client est injoignable, il est retiré et le suivant est essayé.
+\end{enumerate}
+
+Ces fonctions sont appelées \textbf{mutex déjà pris}, par convention, ce qui est indiqué en commentaire dans le code.
+
+\subsection{Déroulement côté client}
+
+Le client crée sa file de réponses, ouvre celle du serveur, installe ses handlers de signaux, se connecte, puis boucle sur la saisie clavier. Chaque saisie déclenche un cycle \code{run\_cycle} : purge des réponses résiduelles, envoi de la requête, attente de la réponse (avec \code{RSP\_WAIT} éventuel et attente bloquante), utilisation de la licence pendant la durée demandée, puis restitution. À la sortie, le client envoie \code{MSG\_DISCONNECT} et supprime sa file.
+
+%------------------------------------------------------------
+\section{Principaux choix de conception}
+%------------------------------------------------------------
+
+\subsection{Une file de requêtes partagée et une file de réponses par client}
+
+Tous les clients écrivent dans la même file \code{/lic\_requests}, lue par le seul serveur. En retour, chaque client possède sa propre file \code{/lic\_reply\_<pid>}. Ce choix évite d'avoir à router les réponses : le serveur sait toujours où répondre grâce au PID, et un client ne reçoit jamais le message d'un autre. Les messages sont \textbf{de taille fixe} (\code{sizeof(Request)} et \code{sizeof(Response)}), ce qui supprime tout problème de découpage.
+
+Ce choix règle aussi le cas de deux clients demandant la même licence en même temps : un seul thread consomme la file, les requêtes sont donc traitées l'une après l'autre dans l'ordre d'arrivée, et la seconde voit la licence déjà occupée.
+
+\subsection{Un mutex unique pour tout l'état}
+
+Plutôt que plusieurs verrous (un par licence, un pour la file d'attente, un pour les clients), le serveur utilise \textbf{un seul mutex}. Les raisons :
+\begin{itemize}
+  \item les opérations sont toujours courtes, la contention est négligeable pour $N=3$ et $M=5$ ;
+  \item les opérations touchent souvent plusieurs structures à la fois (par exemple, \code{remove\_client\_locked} modifie la file d'attente, la table des clients et les licences) : un verrou unique garantit leur atomicité ;
+  \item \textbf{aucun interblocage n'est possible} avec un seul verrou.
+\end{itemize}
+
+\subsection{Envois non bloquants sous mutex}
+
+Les réponses sont envoyées pendant que le mutex est tenu. Pour qu'un client lent ou défaillant ne puisse jamais bloquer tout le serveur, la file du client est ouverte avec \code{O\_NONBLOCK}. Si \code{mq\_open} ou \code{mq\_send} échoue (file absente ou pleine), \code{send\_response} retourne $-1$ et le serveur considère le client comme déconnecté. Toute opération réalisée sous mutex est donc non bloquante.
+
+\subsection{Un point d'entrée unique pour libérer une licence}
+
+Trois événements libèrent une licence : la restitution volontaire, l'expiration et la déconnexion. Tous passent par \code{release\_license}, qui appelle \code{dispatch}. La redistribution aux clients en attente est ainsi écrite \textbf{une seule fois}, ce qui évite des incohérences (une licence libérée mais jamais redistribuée, par exemple).
+
+\subsection{Sémaphore pour les clients, tableau d'états pour les licences}
+
+La limite de $M$ clients est un problème de \textbf{comptage de ressources} : \code{clients\_sem}, initialisé à $M$, est décrémenté à la connexion (\code{sem\_trywait}, qui refuse immédiatement au lieu de bloquer, afin de répondre \code{RSP\_FULL}) et incrémenté à la déconnexion (\code{sem\_post}). Le second argument de \code{sem\_init} vaut 0 : le sémaphore n'est partagé qu'entre threads d'un même processus, ce qui suffit puisque seul le serveur l'utilise.
+
+Ce sémaphore fait en partie double emploi avec le tableau \code{clients[]} (tous les accès se font déjà sous mutex et il n'est jamais utilisé en attente bloquante). Il est conservé car il modélise directement la contrainte « $M$ places », et la cohérence entre les deux est assurée : \code{sem\_post} n'est appelé que dans \code{remove\_client\_locked}, une fois par client retiré.
+
+En revanche, les licences ne sont pas gérées par un simple sémaphore : il faut savoir \textbf{laquelle} est attribuée (numéro, propriétaire, date d'expiration, préférence d'un client). Un tableau d'états protégé par le mutex est donc plus adapté qu'un compteur.
+
+\subsection{Politique d'attribution et historique minimal}
+
+À la demande, le serveur détermine une licence \textbf{préférée}, dans cet ordre : celle demandée explicitement, sinon la dernière utilisée par le client (\code{last\_license}). Si elle est libre, elle est attribuée ; sinon une autre licence libre est proposée (la première par indice). Quand aucune licence n'est libre, le client est placé dans la file avec sa préférence. À la libération d'une licence, \code{dispatch} sert en priorité un client en attente qui préfère cette licence, sinon la tête de file (FIFO).
+
+L'historique est donc celui du \textbf{client} (affinité client $\rightarrow$ licence) : aucune licence ne mémorise son dernier propriétaire. Une demande de licence précise n'est pas une réservation stricte : le serveur peut proposer une autre licence libre plutôt que de faire attendre le client, ce qui privilégie la disponibilité. Ce choix favorise la réutilisation d'une même licence par un même client, au prix d'une équité parfaite (voir section~\ref{sec:difficultes}).
+
+\subsection{Contrôles de cohérence}
+
+Le serveur ne fait pas confiance aux messages reçus :
+\begin{itemize}
+  \item \code{handle\_release} vérifie que \code{lic[k].owner == pid} : un \code{MSG\_RELEASE} tardif ou erroné ne peut pas libérer la licence d'un autre client ;
+  \item \code{handle\_request} refuse (\code{RSP\_ERROR}) un client inconnu, déjà détenteur d'une licence, déjà en attente, ou demandant un numéro hors bornes ;
+  \item \code{handle\_connect} est idempotent : un client déjà connecté reçoit simplement \code{RSP\_OK}, sans consommer un second slot du sémaphore.
+\end{itemize}
+
+\subsection{Choix côté client}
+
+\begin{itemize}
+  \item Le client reste connecté entre deux cycles : la connexion n'a lieu qu'une fois, ce qui permet de tester l'historique et la file d'attente avec un enchaînement de demandes.
+  \item Avant chaque demande, il \textbf{purge} sa file de réponses : un \code{RSP\_EXPIRED} arrivé tardivement lors d'un cycle précédent ne doit pas être pris pour la réponse à la nouvelle demande.
+  \item La durée d'utilisation est mesurée avec \code{mq\_timedreceive} : le client attend soit la fin de la durée, soit un message \code{RSP\_EXPIRED}, soit un signal. Une seule primitive gère les trois cas.
+  \item Le client détecte l'écart entre la licence demandée et la licence proposée et l'affiche.
+\end{itemize}
+
+%------------------------------------------------------------
+\section{Concepts de programmation système Linux mis en \oe uvre}
+%------------------------------------------------------------
+
+\subsection{Processus}
+
+Le serveur et chaque client sont des processus indépendants, sans lien de parenté : ils sont lancés dans des terminaux différents. Ils s'identifient par leur \textbf{PID} (\code{getpid}), qui sert à la fois d'identifiant de client dans le protocole et de suffixe du nom de la file de réponses. Cette isolation impose de passer par un mécanisme d'IPC.
+
+\subsection{Threads POSIX}
+
+Le serveur est multithread : le thread principal traite les requêtes, tandis que \code{monitor\_thread} (créé par \code{pthread\_create}) surveille les expirations. Le thread principal attend sa terminaison avec \code{pthread\_join} à l'arrêt. Le thread de surveillance est nécessaire car le thread principal est bloqué dans \code{mq\_receive} : sans lui, une licence expirée ne serait reprise qu'à l'arrivée du message suivant.
+
+\subsection{Synchronisation : mutex}
+
+\code{pthread\_mutex\_t mtx} protège l'état partagé entre les deux threads (licences, clients, file d'attente). Chaque handler et chaque tour du moniteur prennent le mutex au début et le relâchent à la fin. Les fonctions internes (\code{dispatch}, \code{release\_license}, \code{remove\_client\_locked}) supposent le mutex déjà pris, ce qui évite les verrouillages récursifs.
+
+\subsection{Sémaphores POSIX}
+
+\code{sem\_t clients\_sem} (sémaphore sans nom, initialisé avec \code{sem\_init} à $M$) limite le nombre de clients connectés : \code{sem\_trywait} à la connexion, \code{sem\_post} dans \code{remove\_client\_locked}, \code{sem\_destroy} à l'arrêt.
+
+\subsection{IPC : files de messages POSIX}
+
+La communication repose sur \code{<mqueue.h>} :
+
+\medskip
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{4.6cm}Y@{}}
+\toprule
+\textbf{Appel} & \textbf{Usage}\\
+\midrule
+\code{mq\_open} avec \code{O\_CREAT} & création de la file du serveur (\code{/lic\_requests}) et de la file de chaque client\\
+\code{mq\_open} avec \code{O\_NONBLOCK} & envoi non bloquant des réponses par le serveur\\
+\code{mq\_receive} & lecture bloquante des requêtes par le serveur\\
+\code{mq\_timedreceive} & attente avec délai dans le client (réponses, durée d'utilisation)\\
+\code{mq\_send}, \code{mq\_close} & envoi des messages, fermeture de la file\\
+\code{mq\_unlink} & suppression des files à l'arrêt, et nettoyage d'une éventuelle file résiduelle au démarrage\\
+\bottomrule
+\end{tabularx}
+\medskip
+
+Les attributs (\code{mq\_maxmsg}, \code{mq\_msgsize}) sont fixés à la création pour correspondre à la taille exacte des structures échangées.
+
+\subsection{Signaux}
+
+Le serveur et le client interceptent SIGINT et SIGTERM avec \code{sigaction}. Le gestionnaire se contente de positionner un drapeau \code{volatile sig\_atomic\_t} (\code{running} côté serveur, \code{interrupted} côté client) : aucun travail n'est fait dans le handler, ce qui le rend \textbf{async-signal-safe}.
+
+Deux points importants :
+\begin{itemize}
+  \item \textbf{pas de \code{SA\_RESTART}} : les appels bloquants (\code{mq\_receive}, \code{mq\_timedreceive}, \code{fgets}) doivent être interrompus par le signal et retourner \code{EINTR}, sinon le programme ne réagirait pas à Ctrl-C tant qu'une requête n'est pas arrivée ;
+  \item \textbf{masquage dans le serveur multithread} : avant de créer le thread de surveillance, le thread principal bloque SIGINT et SIGTERM avec \code{pthread\_sigmask}. Le moniteur hérite de ce masque, puis le thread principal le débloque. Les signaux sont ainsi toujours délivrés au thread principal, celui qui est bloqué dans \code{mq\_receive}.
+\end{itemize}
+
+\subsection{Gestion du temps}
+
+\begin{itemize}
+  \item \code{clock\_gettime(CLOCK\_MONOTONIC)} mesure l'âge des licences : cette horloge n'est pas affectée par un changement d'heure du système.
+  \item \code{clock\_gettime(CLOCK\_REALTIME)} sert à calculer l'échéance absolue exigée par \code{mq\_timedreceive}.
+  \item \code{sleep(1)} rythme le thread de surveillance.
+\end{itemize}
+
+\subsection{Mémoire partagée}
+
+La mémoire partagée POSIX (\code{shm\_open}, \code{mmap}) \textbf{n'est pas utilisée}. Entre les threads du serveur, la mémoire est naturellement partagée (variables globales protégées par le mutex). Entre processus, les files de messages suffisent : elles transportent les données et assurent la synchronisation de la communication, sans qu'il soit nécessaire de partager et de verrouiller une zone mémoire entre processus (ce qui aurait exigé des mutex et sémaphores inter-processus).
+
+\subsection{Gestion d'erreurs et ressources}
+
+Les retours de \code{mq\_open}, \code{mq\_send} et \code{mq\_receive} sont testés (\code{perror}, messages explicites). Les files sont libérées à la sortie normale (\code{mq\_close} puis \code{mq\_unlink}) côté client comme côté serveur, et le serveur supprime d'éventuelles files résiduelles au démarrage (\code{mq\_unlink} avant \code{mq\_open}).
+
+%------------------------------------------------------------
+\section{Difficultés rencontrées et solutions apportées}
+\label{sec:difficultes}
+%------------------------------------------------------------
+
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{6.2cm}Y@{}}
+\toprule
+\textbf{Difficulté} & \textbf{Solution}\\
+\midrule
+\textbf{Arrêt propre} : un thread bloqué dans \code{mq\_receive} ne voit pas le drapeau \code{running} changer. & Handler minimal sans \code{SA\_RESTART} pour provoquer \code{EINTR}, et masquage des signaux dans le moniteur pour qu'ils arrivent au thread principal.\\
+\addlinespace
+\textbf{Client défaillant bloquant le serveur} : un \code{mq\_send} bloquant sous mutex figerait tout. & Files de réponses ouvertes en \code{O\_NONBLOCK} ; en cas d'échec, le client est retiré.\\
+\addlinespace
+\textbf{Plusieurs chemins de libération} (volontaire, expiration, déconnexion) risquant des incohérences. & Point d'entrée unique \code{release\_license}, qui appelle \code{dispatch}.\\
+\addlinespace
+\textbf{Messages obsolètes côté client} : un \code{RSP\_EXPIRED} tardif pouvait être pris pour la réponse suivante. & Purge de la file de réponses au début de chaque cycle.\\
+\addlinespace
+\textbf{Libération de la licence d'autrui} par un \code{MSG\_RELEASE} erroné ou tardif. & Contrôle \code{owner == pid} dans \code{handle\_release}.\\
+\addlinespace
+\textbf{Demandes simultanées de la même licence}. & Un seul consommateur de la file de requêtes et une section critique sous mutex : les demandes sont sérialisées, la seconde voit la licence occupée et se voit proposer une autre licence ou est mise en attente.\\
+\addlinespace
+\textbf{Équité contre réutilisation} : favoriser la licence préférée peut faire passer un client devant la tête de file. & Choix assumé, justifié par le sujet (historique) ; amélioration possible en section~\ref{sec:limites}.\\
+\addlinespace
+\textbf{Précision de l'expiration} : le moniteur dort 1~s et les dates sont en secondes entières. & Imprécision d'environ 1~s, acceptable ici et documentée.\\
+\addlinespace
+\textbf{Client qui quitte pendant l'attente ou en détenant une licence.} & \code{MSG\_DISCONNECT} retire le client de la file, libère ses licences et redistribue ; côté client, la variable \code{k} permet de savoir si une licence est détenue au moment du signal.\\
+\bottomrule
+\end{tabularx}
+
+%------------------------------------------------------------
+\section{Limites et améliorations possibles}
+\label{sec:limites}
+%------------------------------------------------------------
+
+Pour être transparent sur la robustesse, voici les limites identifiées :
+\begin{enumerate}
+\item \textbf{Famine possible} : la priorité à la licence préférée peut repousser un client en tête de file. Amélioration : borner cette priorité (par exemple, au-delà d'un temps d'attente, on sert la tête de file).
+ \item \textbf{Retours d'erreur côté client} : après \code{RSP\_WAIT}, toute réponse autre que \code{RSP\_GRANT} produit le même message ; on pourrait distinguer \code{RSP\_ERROR} des autres cas.
+\end{enumerate}
+
+%------------------------------------------------------------
+\section{Exemples d'exécution}
+%------------------------------------------------------------
+
+\emph{Les extraits ci-dessous montrent le format des messages produits par le code (\code{slog} côté serveur, \code{printf} côté client). À remplacer par vos captures réelles ; les PID et les temps varieront.}
+
+\subsection{Démarrage et connexions}
+
+\begin{lstlisting}
+[  0s] serveur demarre : 3 licences, 5 clients max, duree licence max 10s
+[  2s] client 4101 connecte
+[  3s] client 4102 connecte
+[  4s] client 4103 connecte
+\end{lstlisting}
+
+Un sixième client, lorsque cinq sont déjà connectés, reçoit \code{RSP\_FULL} : le serveur affiche \code{client <pid> refuse (serveur plein)} et le client \code{connexion refusee (serveur plein ?)}. \textbf{[capture]}
+
+\subsection{Attribution, attente et redistribution}
+
+Trois clients prennent les licences 0, 1 et 2, un quatrième demande une licence :
+
+\begin{lstlisting}
+[  6s] licence 0 -> client 4101
+[  7s] licence 1 -> client 4102
+[  8s] licence 2 -> client 4103
+[  9s] client 4104 en attente (file: 1)
+[ 11s] licence 0 libre
+[ 11s] licence 0 -> client 4104
+\end{lstlisting}
+
+Côté client 4104 : \code{en attente d'une licence...} puis \code{licence 0 obtenue, utilisation 3s}. \textbf{[capture]}
+
+\subsection{Licence demandée indisponible}
+
+\begin{lstlisting}
+[ 14s] licence 1 demandee par 4105 indisponible -> propose 2
+\end{lstlisting}
+
+Le client affiche \code{licence 1 indisponible, on me propose la 2}. \textbf{[capture]}
+
+\subsection{Expiration}
+
+Un client garde sa licence plus longtemps que \code{LICENSE\_DUREE} :
+
+\begin{lstlisting}
+[ 22s] licence 2 expiree (client 4103)
+[ 22s] licence 2 libre
+\end{lstlisting}
+
+Côté client : \code{licence 2 retiree par le serveur (expiree)}. \textbf{[capture]}
+
+\subsection{Déconnexion d'un client détenteur (Ctrl-C)}
+
+\begin{lstlisting}
+[ 30s] client 4102 deconnecte
+[ 30s] licence 1 libre
+\end{lstlisting}
+
+Côté client : \code{deconnexion : la licence 1 est rendue avec}. \textbf{[capture]}
+
+\subsection{Réattribution de la licence préférée}
+
+Un client qui a déjà utilisé la licence 2, puis refait une demande avec \code{-1}, se voit reproposer la licence 2 si elle est libre. \textbf{[capture]}
+
+\subsection{Arrêt du serveur}
+
+Ctrl-C sur le serveur : \code{arret du serveur}, puis suppression de \code{/lic\_requests}. \textbf{[capture]}
+
+%------------------------------------------------------------
+\section{Conclusion}
+%------------------------------------------------------------
+
+Le projet réalise un serveur de licences flottantes complet : connexion limitée à $M$ clients, attribution de $N$ licences avec file d'attente, historique par client, expiration automatique et libération à la déconnexion. L'architecture repose sur peu de mécanismes, choisis pour leur adéquation : \textbf{files de messages POSIX} pour la communication inter-processus, \textbf{un mutex unique} pour la cohérence de l'état, \textbf{un sémaphore} pour limiter les clients, \textbf{un thread dédié} pour les expirations et une \textbf{gestion rigoureuse des signaux} pour l'arrêt. Les principaux choix (envois non bloquants, point de libération unique, vérification de propriété) visent la robustesse ; les limites restantes sont identifiées et assorties de solutions concrètes.
+
+\end{document}
